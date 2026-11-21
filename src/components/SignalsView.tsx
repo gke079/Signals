@@ -1,5 +1,4 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
-import { Market } from '../types';
 import {
   BarrierFilter,
   MarketSignalSnapshot,
@@ -11,15 +10,32 @@ import {
 } from '../services/signalScannerEngine';
 import { RotateCcw, TrendingUp, Clock, Search, X, Zap } from 'lucide-react';
 
+const SCAN_HOLD_DURATION_MS = 30_000;
+const SLOT_STEP_MS = 2_000;
+const ACTIVE_SCAN_WINDOW_MS = 8_000;
+
+interface LockedMarketEntry {
+  snapshot: MarketSignalSnapshot;
+  lockedAtMs: number;
+  expiresAtMs: number;
+}
+
+interface StaggeredSlotState {
+  isInScanTurn: boolean;
+  activeScanSecondsLeft: number;
+  secondsUntilNextScan: number;
+}
+
 interface SignalsViewProps {
   theme?: 'dark' | 'light';
 }
 
-const ScanningRing: React.FC<{ secondsLeft: number; totalSeconds?: number; size?: number }> = ({
-  secondsLeft,
-  totalSeconds = 17,
-  size = 38,
-}) => {
+const ScanningRing: React.FC<{
+  secondsLeft: number;
+  totalSeconds?: number;
+  size?: number;
+  strokeColor?: string;
+}> = ({ secondsLeft, totalSeconds = 17, size = 38, strokeColor = '#0284c7' }) => {
   const total = Math.max(1, totalSeconds);
   const strokeWidth = 3;
   const radius = (size - strokeWidth * 2) / 2;
@@ -52,7 +68,7 @@ const ScanningRing: React.FC<{ secondsLeft: number; totalSeconds?: number; size?
           cy={size / 2}
           r={radius}
           fill="none"
-          stroke="#0284c7"
+          stroke={strokeColor}
           strokeWidth={strokeWidth}
           strokeLinecap="round"
           strokeDasharray={circumference}
@@ -239,15 +255,223 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
     });
   }, [snapshots, marketCategoryFilter, marketSearchQuery]);
 
+  const [lockedMarkets, setLockedMarkets] = useState<Record<string, LockedMarketEntry>>({});
+  const [forceScanUntilById, setForceScanUntilById] = useState<Record<string, number>>({});
+  const [cycleAnchorMs, setCycleAnchorMs] = useState<number>(() => Date.now());
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+
   const isFeedLive = scannerRef.current?.getIsConnected() ?? false;
   const isLight = theme === 'light';
+
+  // Tick 500ms clock for smooth staggered schedule & per-market 30s hold countdown
+  useEffect(() => {
+    const id = setInterval(() => {
+      setNowMs(Date.now());
+    }, 500);
+    return () => clearInterval(id);
+  }, []);
+
+  // Reset locks and staggered schedule anchor when switching signal category or filters
+  useEffect(() => {
+    const t = Date.now();
+    setLockedMarkets({});
+    setForceScanUntilById({});
+    setCycleAnchorMs(t);
+    setNowMs(t);
+  }, [
+    category,
+    evenOddStrategyFilter,
+    overUnderBarrier,
+    overUnder27Filter,
+    onlyUpDownStrategy,
+    marketCategoryFilter,
+    marketSearchQuery,
+  ]);
+
+  const cycleDurationMs = Math.max(16_000, filteredSnapshots.length * SLOT_STEP_MS);
+
+  // Compute staggered scan turn per market so volatilities scan at DIFFERENT times (2s apart)
+  const staggeredSlotsById = useMemo(() => {
+    const map = new Map<string, StaggeredSlotState>();
+    filteredSnapshots.forEach((snap, idx) => {
+      const manualUntil = forceScanUntilById[snap.market.id] ?? 0;
+      if (nowMs < manualUntil) {
+        map.set(snap.market.id, {
+          isInScanTurn: true,
+          activeScanSecondsLeft: Math.max(1, Math.ceil((manualUntil - nowMs) / 1000)),
+          secondsUntilNextScan: 0,
+        });
+        return;
+      }
+
+      const elapsedSinceSlot = nowMs - cycleAnchorMs - idx * SLOT_STEP_MS;
+      if (elapsedSinceSlot < 0) {
+        map.set(snap.market.id, {
+          isInScanTurn: false,
+          activeScanSecondsLeft: 0,
+          secondsUntilNextScan: Math.max(1, Math.ceil(-elapsedSinceSlot / 1000)),
+        });
+        return;
+      }
+
+      const posInCycle = elapsedSinceSlot % cycleDurationMs;
+      const isInScanTurn = posInCycle < ACTIVE_SCAN_WINDOW_MS;
+      const activeScanSecondsLeft = isInScanTurn
+        ? Math.max(1, Math.ceil((ACTIVE_SCAN_WINDOW_MS - posInCycle) / 1000))
+        : 0;
+      const secondsUntilNextScan = isInScanTurn
+        ? 0
+        : Math.max(1, Math.ceil((cycleDurationMs - posInCycle) / 1000));
+
+      map.set(snap.market.id, {
+        isInScanTurn,
+        activeScanSecondsLeft,
+        secondsUntilNextScan,
+      });
+    });
+    return map;
+  }, [filteredSnapshots, forceScanUntilById, nowMs, cycleAnchorMs, cycleDurationMs]);
+
+  // Independent staggered per-volatility 30-second lock manager:
+  // Only evaluates and locks a volatility during its own scheduled scan turn (or manual scan),
+  // stopping scanning on THAT volatility for 30s once valid while others follow their staggered turns.
+  useEffect(() => {
+    const currentNow = Date.now();
+    setLockedMarkets((prev) => {
+      let changed = false;
+      const next: Record<string, LockedMarketEntry> = {};
+
+      for (const [id, entry] of Object.entries(prev)) {
+        if (currentNow < entry.expiresAtMs) {
+          next[id] = entry;
+        } else {
+          changed = true;
+        }
+      }
+
+      for (const snap of filteredSnapshots) {
+        const slot = staggeredSlotsById.get(snap.market.id);
+        if (slot?.isInScanTurn && !snap.isScanning && !next[snap.market.id]) {
+          next[snap.market.id] = {
+            snapshot: snap,
+            lockedAtMs: currentNow,
+            expiresAtMs: currentNow + SCAN_HOLD_DURATION_MS,
+          };
+          changed = true;
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [nowMs, filteredSnapshots, staggeredSlotsById]);
+
+  const activeLockedEntries = useMemo(() => {
+    const entries: Array<{ id: string; entry: LockedMarketEntry }> = [];
+    for (const snap of filteredSnapshots) {
+      const entry = lockedMarkets[snap.market.id];
+      if (entry && nowMs < entry.expiresAtMs) {
+        entries.push({ id: snap.market.id, entry });
+      }
+    }
+    entries.sort((a, b) => {
+      const sa = a.entry.snapshot;
+      const sb = b.entry.snapshot;
+      if (sa.entryConfirmedNow !== sb.entryConfirmedNow) {
+        return sa.entryConfirmedNow ? -1 : 1;
+      }
+      if (sb.entryConfidencePct !== sa.entryConfidencePct) {
+        return sb.entryConfidencePct - sa.entryConfidencePct;
+      }
+      return sb.edgeDeltaPct - sa.edgeDeltaPct;
+    });
+    return entries;
+  }, [filteredSnapshots, lockedMarkets, nowMs]);
+
+  const { activeScanCount, queuedCount } = useMemo(() => {
+    let active = 0;
+    let queued = 0;
+    for (const snap of filteredSnapshots) {
+      const lock = lockedMarkets[snap.market.id];
+      if (lock && nowMs < lock.expiresAtMs) continue;
+      if (staggeredSlotsById.get(snap.market.id)?.isInScanTurn) {
+        active++;
+      } else {
+        queued++;
+      }
+    }
+    return { activeScanCount: active, queuedCount: queued };
+  }, [filteredSnapshots, lockedMarkets, nowMs, staggeredSlotsById]);
+
+  const handleResumeScanNow = (marketId?: string) => {
+    const currentNow = Date.now();
+    if (marketId) {
+      setLockedMarkets((prev) => {
+        if (!prev[marketId]) return prev;
+        const copy = { ...prev };
+        delete copy[marketId];
+        return copy;
+      });
+      setForceScanUntilById((prev) => ({
+        ...prev,
+        [marketId]: currentNow + ACTIVE_SCAN_WINDOW_MS,
+      }));
+    } else {
+      setLockedMarkets({});
+      setForceScanUntilById({});
+      setCycleAnchorMs(currentNow);
+    }
+    setNowMs(currentNow);
+  };
+
+  const handleScanQueuedMarketNow = (marketId: string) => {
+    const currentNow = Date.now();
+    setForceScanUntilById((prev) => ({
+      ...prev,
+      [marketId]: currentNow + ACTIVE_SCAN_WINDOW_MS,
+    }));
+    setNowMs(currentNow);
+  };
+
+  // Pin all currently valid/locked markets first in the grid, while all other volatilities
+  // scan on their own staggered schedule underneath.
+  const orderedSnapshots: MarketSignalSnapshot[] = useMemo(() => {
+    if (activeLockedEntries.length === 0) return filteredSnapshots;
+
+    const liveById = new Map<string, MarketSignalSnapshot>();
+    for (const s of filteredSnapshots) {
+      liveById.set(s.market.id, s);
+    }
+
+    const lockedIdSet = new Set<string>();
+    const lockedMerged: MarketSignalSnapshot[] = [];
+
+    for (const { id, entry } of activeLockedEntries) {
+      lockedIdSet.add(id);
+      const liveSnap = liveById.get(id);
+      lockedMerged.push(
+        liveSnap
+          ? {
+              ...entry.snapshot,
+              lastQuote: liveSnap.lastQuote,
+              lastDigit: liveSnap.lastDigit,
+              recentDigits: liveSnap.recentDigits,
+              recentDirections: liveSnap.recentDirections,
+              isLiveWs: liveSnap.isLiveWs,
+            }
+          : entry.snapshot
+      );
+    }
+
+    const others = filteredSnapshots.filter((s) => !lockedIdSet.has(s.market.id));
+    return [...lockedMerged, ...others];
+  }, [filteredSnapshots, activeLockedEntries]);
 
   return (
     <div className="flex flex-col gap-4 w-full">
       {/* 1. HEADER & LIVE FEED STATUS */}
       <div className="flex flex-col gap-1.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2.5 flex-wrap">
             <h2
               className={`text-xl sm:text-2xl font-extrabold tracking-tight ${
                 isLight ? 'text-slate-900' : 'text-white'
@@ -263,6 +487,23 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
               }`}
             >
               {isFeedLive ? 'Live feed' : 'Syncing feed'}
+            </span>
+            <span
+              className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold border ${
+                activeLockedEntries.length > 0
+                  ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                  : 'bg-blue-50 text-blue-700 border-blue-200'
+              }`}
+            >
+              {activeLockedEntries.length > 0 ? (
+                <span>
+                  {activeLockedEntries.length} Valid · {activeScanCount} Scanning · {queuedCount} Queued
+                </span>
+              ) : (
+                <span>
+                  {activeScanCount} Scanning · {queuedCount} Queued (Staggered)
+                </span>
+              )}
             </span>
           </div>
         </div>
@@ -590,8 +831,59 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
         </div>
       </div>
 
+      {/* 3D. ACTIVE VALID MARKETS BANNER (PER-MARKET 30S HOLD WHILE OTHER VOLATILITIES KEEP SCANNING) */}
+      {activeLockedEntries.length > 0 && (
+        <div className="rounded-2xl border border-emerald-300 bg-emerald-50 text-emerald-950 px-4 py-3 flex flex-col gap-2 shadow-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 flex-wrap text-xs sm:text-sm">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-600 animate-pulse shrink-0" />
+              <span className="font-extrabold">
+                {activeLockedEntries.length === 1
+                  ? '1 Valid Market Found:'
+                  : `${activeLockedEntries.length} Valid Markets Found:`}
+              </span>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {activeLockedEntries.map(({ id, entry }) => {
+                  const secLeft = Math.max(1, Math.ceil((entry.expiresAtMs - nowMs) / 1000));
+                  const m = entry.snapshot;
+                  return (
+                    <span
+                      key={id}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-white text-emerald-900 border border-emerald-300"
+                    >
+                      <span>{m.market.name.replace('Volatility ', 'V').replace(' Index', '')}</span>
+                      <span className="px-1.5 py-0.2 rounded-full text-[10px] font-black uppercase bg-emerald-600 text-white">
+                        {m.signalLabel}
+                      </span>
+                      <span className="font-mono text-[10px] text-emerald-700">
+                        {m.entryConfidencePct}% · {secLeft}s
+                      </span>
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-mono font-bold text-emerald-900 bg-white px-2.5 py-1 rounded-lg border border-emerald-200">
+                {activeScanCount > 0 || queuedCount > 0
+                  ? `${activeScanCount} scanning · ${queuedCount} queued`
+                  : 'All filtered markets ready'}
+              </span>
+              <button
+                type="button"
+                onClick={() => handleResumeScanNow()}
+                className="px-2.5 py-1 rounded-lg text-xs font-bold bg-white hover:bg-emerald-100 text-emerald-800 border border-emerald-300 cursor-pointer transition-colors whitespace-nowrap"
+              >
+                Rescan All
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 4. HIGH-DENSITY COMPACT MULTI-MARKET BOT CARDS GRID (MOBILE-OPTIMIZED) */}
-      {filteredSnapshots.length === 0 ? (
+      {orderedSnapshots.length === 0 ? (
         <div className="p-8 rounded-xl border border-dashed border-slate-300 text-center flex flex-col items-center justify-center gap-2 bg-slate-50">
           <p className="text-sm font-semibold text-slate-700">No markets match your current filter</p>
           <button
@@ -607,8 +899,17 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5 sm:gap-3">
-          {filteredSnapshots.map((snap) => {
-          const showScanningState = snap.isScanning;
+          {orderedSnapshots.map((snap) => {
+          const lockEntry = lockedMarkets[snap.market.id];
+          const isLockedCard = Boolean(lockEntry && nowMs < lockEntry.expiresAtMs);
+          const cardHoldSecondsLeft =
+            isLockedCard && lockEntry
+              ? Math.max(1, Math.ceil((lockEntry.expiresAtMs - nowMs) / 1000))
+              : 0;
+          const slotState = staggeredSlotsById.get(snap.market.id);
+          const isInScanTurn = slotState?.isInScanTurn ?? true;
+          const isQueuedTurn = !isLockedCard && !isInScanTurn;
+          const showScanningState = !isLockedCard && isInScanTurn;
           const displaySignalLabel = snap.signalLabel;
           const displaySignalTone = snap.signalTone;
           const displayContractType = snap.contractType;
@@ -621,12 +922,24 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
           return (
             <div
               key={`${category}-${snap.market.id}`}
-              className="relative rounded-xl border p-2.5 sm:p-3 flex flex-col justify-between gap-2.5 transition-all overflow-hidden bg-white shadow-xs hover:shadow-md border-slate-200/90 hover:border-slate-300"
+              className={`relative rounded-xl border p-2.5 sm:p-3 flex flex-col justify-between gap-2.5 transition-all overflow-hidden bg-white shadow-xs ${
+                isLockedCard
+                  ? 'ring-2 ring-emerald-500 border-emerald-500 shadow-md'
+                  : isQueuedTurn
+                  ? 'border-slate-200/80 bg-slate-50/40'
+                  : 'border-sky-300 ring-1 ring-sky-200/70 shadow-sm hover:shadow-md'
+              }`}
             >
               {/* Compact Card Header */}
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2 min-w-0">
-                  <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border bg-slate-100 text-slate-700 border-slate-200">
+                  <div
+                    className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border ${
+                      isLockedCard
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-300'
+                        : 'bg-slate-100 text-slate-700 border-slate-200'
+                    }`}
+                  >
                     <TrendingUp className="w-3.5 h-3.5" />
                   </div>
                   <div className="min-w-0">
@@ -723,12 +1036,39 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
               </div>
 
               {/* Card Body */}
-              {showScanningState ? (
+              {isQueuedTurn ? (
                 <div className="flex flex-col gap-2 pt-1 border-t border-slate-100">
                   <div className="flex items-center gap-2.5">
                     <ScanningRing
-                      secondsLeft={snap.scanSecondsLeft}
-                      totalSeconds={snap.scanTotalSeconds}
+                      secondsLeft={slotState?.secondsUntilNextScan ?? 1}
+                      totalSeconds={Math.ceil(cycleDurationMs / 1000)}
+                      size={36}
+                      strokeColor="#94a3b8"
+                    />
+                    <div className="flex flex-col min-w-0">
+                      <span className="text-xs font-bold tracking-wide text-slate-700 uppercase truncate">
+                        QUEUED · SCANS IN {slotState?.secondsUntilNextScan ?? 1}s
+                      </span>
+                      <span className="text-[11px] text-slate-500 font-mono tabular-nums truncate">
+                        Staggered turn · {snap.windowTickCount} ticks synced
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleScanQueuedMarketNow(snap.market.id)}
+                    title="Click to scan this volatility right now"
+                    className="w-full py-1.5 px-3 rounded-lg text-xs font-semibold text-center border truncate bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200 cursor-pointer transition-colors"
+                  >
+                    Waiting turn ({slotState?.secondsUntilNextScan ?? 1}s) · Scan Now
+                  </button>
+                </div>
+              ) : showScanningState ? (
+                <div className="flex flex-col gap-2 pt-1 border-t border-slate-100">
+                  <div className="flex items-center gap-2.5">
+                    <ScanningRing
+                      secondsLeft={slotState?.activeScanSecondsLeft ?? snap.scanSecondsLeft}
+                      totalSeconds={Math.ceil(ACTIVE_SCAN_WINDOW_MS / 1000)}
                       size={36}
                     />
                     <div className="flex flex-col min-w-0">
@@ -853,19 +1193,31 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
                 <div className="flex flex-col gap-2 pt-1 border-t border-slate-100">
                   {/* Signal Badge & Confidence */}
                   <div className="flex items-center justify-between gap-1.5 flex-wrap">
-                    <span
-                      className={`px-2 py-0.5 rounded-full text-xs font-extrabold tracking-wide uppercase shrink-0 shadow-2xs ${
-                        displaySignalTone === 'emerald'
-                          ? 'bg-[#10b981] text-emerald-50'
-                          : displaySignalTone === 'fuchsia'
-                          ? 'bg-[#c026d3] text-fuchsia-50'
-                          : displaySignalTone === 'amber'
-                          ? 'bg-amber-500 text-slate-950 font-black'
-                          : 'bg-[#0284c7] text-sky-50'
-                      }`}
-                    >
-                      {displaySignalLabel}
-                    </span>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-xs font-extrabold tracking-wide uppercase shrink-0 shadow-2xs ${
+                          displaySignalTone === 'emerald'
+                            ? 'bg-[#10b981] text-emerald-50'
+                            : displaySignalTone === 'fuchsia'
+                            ? 'bg-[#c026d3] text-fuchsia-50'
+                            : displaySignalTone === 'amber'
+                            ? 'bg-amber-500 text-slate-950 font-black'
+                            : 'bg-[#0284c7] text-sky-50'
+                        }`}
+                      >
+                        {displaySignalLabel}
+                      </span>
+                      {isLockedCard && (
+                        <button
+                          type="button"
+                          onClick={() => handleResumeScanNow(snap.market.id)}
+                          title="Locked for 30s for bot setup · Click to rescan this market now"
+                          className="px-1.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-emerald-100 hover:bg-emerald-200 text-emerald-800 border border-emerald-300 cursor-pointer transition-colors"
+                        >
+                          LOCKED · {cardHoldSecondsLeft}s ↻
+                        </button>
+                      )}
+                    </div>
 
                     <div className="flex items-center gap-1.5 text-xs font-mono tabular-nums">
                       <span className="font-extrabold text-slate-900">

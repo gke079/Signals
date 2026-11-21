@@ -1836,7 +1836,7 @@ export class MultiMarketSignalScanner {
     const fallbackBarrier = overUnderBarrier === 'all' ? 4 : overUnderBarrier;
     const fallbackType: 'OVER' | 'UNDER' = fallbackBarrier >= 4 ? 'OVER' : 'UNDER';
 
-    const { cycleId, inScanPhase, scanSecondsLeft } = this.getCycleTiming(
+    const { cycleId, scanSecondsLeft } = this.getCycleTiming(
       nowSec,
       st.overUnderPhaseOffsetSec
     );
@@ -1858,40 +1858,36 @@ export class MultiMarketSignalScanner {
     let patternSummary = '';
     let topBarriersSummary = '';
     let hasStrongEdge = false;
-    let isScanning = inScanPhase;
+    let isScanning = true;
     let scanStatusNote = `${ouWindowDigits.length} ticks · scanning Over 4–7 & Under 5–2`;
 
     const defaultStat = barrierStats.find((s) => s.digit === prediction);
     let activeOverPct = defaultStat?.overPct ?? 50;
     let activeUnderPct = defaultStat?.underPct ?? 50;
 
-    if (inScanPhase) {
-      isScanning = true;
-      scanStatusNote = `${ouWindowDigits.length} ticks · scanning Over 4–7 & Under 5–2`;
-    } else {
-      let chosen: BarrierCandidateEvaluation | undefined = qualifying[0];
+    let chosen: BarrierCandidateEvaluation | undefined = qualifying[0];
 
-      const existingLock = st.lockedOverUnder;
-      if (
-        existingLock &&
-        existingLock.cycleId === cycleId &&
-        existingLock.barrierFilterKey === filterKey
-      ) {
-        const lockedCand = scopedCandidates.find(
-          (c) =>
-            c.contractType === existingLock.contractType && c.barrier === existingLock.barrier
-        );
-        if (lockedCand && lockedCand.winPct >= lockedCand.requiredPct - 5) {
-          chosen = lockedCand;
-        }
+    const existingLock = st.lockedOverUnder;
+    if (
+      existingLock &&
+      existingLock.cycleId === cycleId &&
+      existingLock.barrierFilterKey === filterKey
+    ) {
+      const lockedCand = scopedCandidates.find(
+        (c) =>
+          c.contractType === existingLock.contractType && c.barrier === existingLock.barrier
+      );
+      if (lockedCand && lockedCand.winPct >= lockedCand.requiredPct - 5) {
+        chosen = lockedCand;
       }
+    }
 
-      if (!chosen) {
-        isScanning = true;
-        scanStatusNote = closest
-          ? `Best ${closest.contractType === 'OVER' ? 'O' : 'U'}${closest.barrier}: ${closest.winPct}% (req ≥${closest.requiredPct}%) · Scan again`
-          : 'Scanning Over 4–7 & Under 5–2';
-      } else {
+    if (!chosen) {
+      isScanning = true;
+      scanStatusNote = closest
+        ? `Best ${closest.contractType === 'OVER' ? 'O' : 'U'}${closest.barrier}: ${closest.winPct}% (req ≥${closest.requiredPct}%) · Scan again`
+        : 'Scanning Over 4–7 & Under 5–2';
+    } else {
         st.lockedOverUnder = {
           cycleId,
           barrierFilterKey: filterKey,
@@ -1927,11 +1923,10 @@ export class MultiMarketSignalScanner {
         distributionSubtext = `${chosen.winPct}% ${chosen.contractType.toLowerCase()} ${chosen.barrier} (req ≥${chosen.requiredPct}%) · ${chosen.patternName}`;
         patternSummary = ouConfirm.statusText;
 
-        topBarriersSummary = (qualifying.length > 0 ? qualifying : [chosen])
-          .slice(0, 3)
-          .map((c) => `${c.contractType === 'OVER' ? 'O' : 'U'}${c.barrier} ${c.winPct}%`)
-          .join(' · ');
-      }
+      topBarriersSummary = (qualifying.length > 0 ? qualifying : [chosen])
+        .slice(0, 3)
+        .map((c) => `${c.contractType === 'OVER' ? 'O' : 'U'}${c.barrier} ${c.winPct}%`)
+        .join(' · ');
     }
 
     return {
@@ -2231,7 +2226,7 @@ export class MultiMarketSignalScanner {
       }
     }
 
-    const { cycleId, inScanPhase, scanSecondsLeft } = this.getCycleTiming(
+    const { cycleId, scanSecondsLeft } = this.getCycleTiming(
       nowSec,
       st.matchPhaseOffsetSec
     );
@@ -2250,20 +2245,14 @@ export class MultiMarketSignalScanner {
     const pickedPct = Math.round((pickedCount / last10Total) * 100);
     const coldDigitPct = Math.round((matchCounts[coldDigit] / last10Total) * 100);
 
-    let isScanning = inScanPhase;
+    let isScanning = true;
     let scanStatusNote = 'Last 10 ticks · Scanning digit occurrences';
     let entryConfirmedNow = false;
     let hasStrongEdge = false;
     let distributionSubtext = `Digit #${pickedDigit}: ${pickedCount}/${last10Digits.length} ticks (${pickedPct}%) in last 10 ticks`;
     let patternSummary = '';
 
-    if (inScanPhase) {
-      isScanning = true;
-      scanStatusNote =
-        pickedCount >= 2
-          ? `Last 10 ticks · Top #${pickedDigit} (${pickedCount}/10) · Scanning`
-          : 'Last 10 ticks · Scanning digit occurrences';
-    } else if (last10Digits.length < 10 || pickedCount < 2) {
+    if (last10Digits.length < 10 || pickedCount < 2) {
       st.lockedMatch = undefined;
       isScanning = true;
       scanStatusNote = '1x each in last 10 ticks · No dominant digit, scan again';
