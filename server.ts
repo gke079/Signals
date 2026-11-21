@@ -1,0 +1,150 @@
+import express from 'express';
+import { createServer as createViteServer } from 'vite';
+import { createServer } from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
+
+import path from 'path';
+
+async function startServer() {
+  const app = express();
+  const server = createServer(app);
+
+  if (process.env.NODE_ENV === 'production') {
+    const distPath = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.resolve(distPath, 'index.html'));
+    });
+  } else {
+    // Set up Vite middleware in development
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server },
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (request, socket, head) => {
+    if (request.headers['sec-websocket-protocol'] === 'vite-hmr') {
+      return;
+    }
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  });
+
+  wss.on('connection', (clientWs) => {
+    let derivWs: WebSocket | null = null;
+
+    const connectToDeriv = (symbol: string, appId: string = '1089', token?: string) => {
+      if (derivWs) {
+        try {
+          derivWs.close();
+        } catch {}
+      }
+
+      const derivUrl = appId
+        ? `wss://api.derivws.com/trading/v1/options/ws/public?app_id=${appId}`
+        : `wss://api.derivws.com/trading/v1/options/ws/public`;
+      derivWs = new WebSocket(derivUrl);
+
+      derivWs.on('open', () => {
+        clientWs.send(JSON.stringify({ type: 'status', status: 'connected' }));
+        if (token) {
+          derivWs?.send(JSON.stringify({ authorize: token }));
+        }
+        // 1. Request historical ticks and subscribe to live ticks
+        derivWs?.send(
+          JSON.stringify({
+            ticks_history: symbol,
+            count: 300,
+            end: 'latest',
+            style: 'ticks',
+          })
+        );
+        derivWs?.send(
+          JSON.stringify({
+            ticks: symbol,
+            subscribe: 1,
+          })
+        );
+        // 2. Request historical OHLC candles and subscribe to live candle updates
+        derivWs?.send(
+          JSON.stringify({
+            ticks_history: symbol,
+            count: 50,
+            end: 'latest',
+            style: 'candles',
+            granularity: 60,
+            subscribe: 1,
+          })
+        );
+      });
+
+      derivWs.on('message', (data) => {
+        try {
+          const parsed = JSON.parse(data.toString());
+          clientWs.send(JSON.stringify({ type: 'deriv_message', data: parsed }));
+        } catch {}
+      });
+
+      derivWs.on('error', (err) => {
+        clientWs.send(JSON.stringify({ type: 'status', status: 'error', message: err.message }));
+      });
+
+      derivWs.on('close', () => {
+        clientWs.send(JSON.stringify({ type: 'status', status: 'disconnected' }));
+      });
+    };
+
+    clientWs.on('message', (message) => {
+      try {
+        const msg = JSON.parse(message.toString());
+        if (msg.action === 'subscribe') {
+          connectToDeriv(msg.symbol || 'R_75', msg.appId || '1089', msg.token);
+        } else if (msg.action === 'candles' || msg.action === 'ohlc') {
+          if (derivWs && derivWs.readyState === WebSocket.OPEN) {
+            derivWs.send(
+              JSON.stringify({
+                ticks_history: msg.symbol || 'R_75',
+                count: msg.count || 50,
+                end: 'latest',
+                style: 'candles',
+                granularity: msg.granularity || 60,
+                subscribe: msg.subscribe ? 1 : undefined,
+              })
+            );
+          }
+        } else if (msg.action === 'ping') {
+          if (derivWs && derivWs.readyState === WebSocket.OPEN) {
+            derivWs.send(JSON.stringify({ ping: 1 }));
+          }
+        } else if (msg.raw_req) {
+          if (derivWs && derivWs.readyState === WebSocket.OPEN) {
+            derivWs.send(JSON.stringify(msg.raw_req));
+          }
+        }
+      } catch {}
+    });
+
+    clientWs.on('close', () => {
+      if (derivWs) {
+        try {
+          derivWs.close();
+        } catch {}
+      }
+    });
+  });
+
+  const PORT = Number(process.env.PORT) || 3000;
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();
